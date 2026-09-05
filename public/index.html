@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Undertow — stir the current</title>
+<meta name="description" content="A real-time GPU fluid simulation in your browser. Drag to stir dye into the current. WebGL2, no server, no dependencies.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root{
+    --bg:#04060c; --panel:rgba(8,12,20,.55); --stroke:rgba(140,180,220,.14);
+    --text:#e9edf8; --muted:#7a869e; --acc:#5eead4;
+    --sans:system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:hidden;font-family:var(--sans)}
+  #c{position:fixed;inset:0;width:100vw;height:100vh;display:block;touch-action:none;cursor:crosshair}
+  .overlay{position:fixed;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;padding:clamp(16px,3.2vw,38px)}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.26em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:9px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--acc);box-shadow:0 0 10px var(--acc);animation:p 2.6s ease-in-out infinite}
+  @keyframes p{0%,100%{opacity:.35}50%{opacity:1}}
+  h1{font-size:clamp(38px,8.5vw,120px);font-weight:200;letter-spacing:.13em;margin:10px 0 0;line-height:.98;text-wrap:balance;text-shadow:0 0 40px rgba(94,234,212,.12)}
+  .tag{margin:13px 0 0;color:var(--muted);font-size:clamp(13px,1.5vw,16px);max-width:38ch;line-height:1.5}
+  .bar{pointer-events:auto;display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--stroke);border-radius:14px;padding:8px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);width:fit-content;max-width:100%}
+  button{font:500 13px var(--sans);color:var(--text);background:rgba(255,255,255,.04);border:1px solid var(--stroke);border-radius:9px;padding:9px 13px;cursor:pointer;transition:background .18s,border-color .18s,transform .05s}
+  button:hover{background:rgba(255,255,255,.09);border-color:rgba(140,180,220,.3)}
+  button:active{transform:translateY(1px)}
+  button[aria-pressed="true"]{background:rgba(94,234,212,.14);border-color:rgba(94,234,212,.55);color:#fff}
+  .meta{font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--muted);padding:0 6px;text-transform:uppercase;white-space:nowrap}
+  .fallback{position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:24px}
+  .fallback.on{display:grid}
+  .fallback .card{max-width:44ch}
+  .fallback h2{font-weight:300;letter-spacing:.06em}
+  .fallback p{color:var(--muted);line-height:1.6}
+  .fallback code{font-family:var(--mono);font-size:13px}
+  @media (prefers-reduced-motion:reduce){.dot{animation:none}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="overlay">
+  <div>
+    <div class="eyebrow"><span class="dot"></span>Live GPU fluid &middot; WebGL2</div>
+    <h1>UNDERTOW</h1>
+    <p class="tag">A stable-fluids solver running on your GPU. Drag to stir dye into the current and watch it fold.</p>
+  </div>
+  <div class="bar" role="toolbar" aria-label="Simulation controls">
+    <span class="meta" id="fps">-- fps</span>
+    <button data-pal="0" aria-pressed="true">Lagoon</button>
+    <button data-pal="1" aria-pressed="false">Ember</button>
+    <button data-pal="2" aria-pressed="false">Bloom</button>
+    <button data-pal="3" aria-pressed="false">Ghost</button>
+    <button id="pause">Pause</button>
+    <button id="reset">Reset</button>
+  </div>
+</div>
+<div class="fallback" id="fallback">
+  <div class="card">
+    <h2>No floating-point canvas</h2>
+    <p>This experiment needs WebGL2 with float render targets (<code>EXT_color_buffer_float</code>). Open it in a recent Chrome, Edge, Safari, or Firefox and the current will appear.</p>
+  </div>
+</div>
+<script>
+'use strict';
+/* Undertow: a stable-fluids dye simulation on the visitor GPU.
+ * Velocity + dye + pressure live in float textures. Every frame:
+ * splat pointer -> advect velocity -> divergence -> pressure Jacobi x20
+ * -> subtract gradient -> advect dye -> display. No CPU in the loop. */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, depth: false, alpha: false });
+if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+  document.getElementById('fallback').classList.add('on');
+} else {
+  main();
+}
+
+function main() {
+  const linear = !!gl.getExtension('OES_texture_float_linear');
+  const FILTER = linear ? gl.LINEAR : gl.NEAREST;
+  const SIM = 128, DYE = 512, JACOBI = 20;
+  const PALS = [
+    [[0.10, 0.85, 0.95], [0.35, 0.45, 1.00], [0.55, 1.00, 0.75]],
+    [[1.00, 0.35, 0.15], [1.00, 0.70, 0.20], [0.85, 0.15, 0.45]],
+    [[0.75, 0.40, 1.00], [0.30, 0.90, 1.00], [1.00, 0.45, 0.85]],
+    [[0.75, 0.80, 0.90], [0.45, 0.55, 0.70], [0.90, 0.92, 0.95]],
+  ];
+  let pal = 0, colorTick = 0, paused = false, lastPointer = 0;
+
+  const VS = `#version 300 es
+  layout(location=0) in vec2 aPos; out vec2 vUv;
+  void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0.,1.); }`;
+  const FS_SPLAT = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uT; uniform float uAsp; uniform vec2 uP; uniform vec3 uV; uniform float uR;
+  void main(){ vec2 d = vUv - uP; d.x *= uAsp;
+    float g = exp(-dot(d,d)/uR);
+    o = vec4(texture(uT, vUv).xyz + uV*g, 1.); }`;
+  const FS_ADV = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uV, uS; uniform float uDt, uDis;
+  void main(){ vec2 v = texture(uV, vUv).xy;
+    o = texture(uS, vUv - uDt*v) / (1.0 + uDis*uDt); }`;
+  const FS_DIV = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uV; uniform vec2 uTx;
+  void main(){
+    float L = texture(uV, vUv - vec2(uTx.x,0.)).x;
+    float R = texture(uV, vUv + vec2(uTx.x,0.)).x;
+    float B = texture(uV, vUv - vec2(0.,uTx.y)).y;
+    float T = texture(uV, vUv + vec2(0.,uTx.y)).y;
+    o = vec4(0.5*((R-L)+(T-B)), 0., 0., 1.); }`;
+  const FS_PRS = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uP, uD; uniform vec2 uTx;
+  void main(){
+    float L = texture(uP, vUv - vec2(uTx.x,0.)).x;
+    float R = texture(uP, vUv + vec2(uTx.x,0.)).x;
+    float B = texture(uP, vUv - vec2(0.,uTx.y)).x;
+    float T = texture(uP, vUv + vec2(0.,uTx.y)).x;
+    float d = texture(uD, vUv).x;
+    o = vec4((L+R+B+T-d)*0.25, 0., 0., 1.); }`;
+  const FS_GRD = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uV, uP; uniform vec2 uTx;
+  void main(){
+    float L = texture(uP, vUv - vec2(uTx.x,0.)).x;
+    float R = texture(uP, vUv + vec2(uTx.x,0.)).x;
+    float B = texture(uP, vUv - vec2(0.,uTx.y)).x;
+    float T = texture(uP, vUv + vec2(0.,uTx.y)).x;
+    vec2 v = texture(uV, vUv).xy - 0.5*vec2(R-L, T-B);
+    o = vec4(v, 0., 1.); }`;
+  const FS_CLR = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uT; uniform float uK;
+  void main(){ o = vec4(texture(uT, vUv).xyz*uK, 1.); }`;
+  const FS_SHOW = `#version 300 es
+  precision highp float; in vec2 vUv; out vec4 o;
+  uniform sampler2D uD;
+  void main(){
+    vec3 c = texture(uD, vUv).rgb;
+    c = vec3(1.) - exp(-c*1.6);
+    float vig = smoothstep(1.25, 0.3, length(vUv-0.5)*1.5);
+    vec3 bg = vec3(0.016, 0.024, 0.047);
+    float m = clamp(max(c.r, max(c.g, c.b))*1.35, 0., 1.);
+    vec3 col = mix(bg, c, m) * (0.5 + 0.5*vig);
+    o = vec4(col, 1.); }`;
+
+  function prog(fs) {
+    const v = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(v, VS); gl.compileShader(v);
+    const f = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(f, fs); gl.compileShader(f);
+    if (!gl.getShaderParameter(f, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(f));
+    const p = gl.createProgram();
+    gl.attachShader(p, v); gl.attachShader(p, f);
+    gl.bindAttribLocation(p, 0, 'aPos'); gl.linkProgram(p);
+    return p;
+  }
+  const P = {
+    splat: prog(FS_SPLAT), adv: prog(FS_ADV), div: prog(FS_DIV),
+    prs: prog(FS_PRS), grd: prog(FS_GRD), clr: prog(FS_CLR), show: prog(FS_SHOW),
+  };
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  function fbo(w, h) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, FILTER);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, FILTER);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    return { t, f, w, h };
+  }
+  function dbl(w, h) {
+    const a = fbo(w, h), b = fbo(w, h);
+    return { read: a, write: b, swap() { const t = this.read; this.read = this.write; this.write = t; } };
+  }
+  let vel = dbl(SIM, SIM), dye = dbl(DYE, DYE);
+  let div = fbo(SIM, SIM), prs = dbl(SIM, SIM);
+
+  function bindTex(p, name, unit, tex) {
+    const loc = gl.getUniformLocation(p, name);
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(loc, unit);
+  }
+  function target(f, w, h) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f ? f.f : null);
+    gl.viewport(0, 0, w, h);
+  }
+  function splat(dst, x, y, vx, vy, vz, r) {
+    const p = P.splat; gl.useProgram(p);
+    target(dst.write, dst.write.w, dst.write.h);
+    bindTex(p, 'uT', 0, dst.read.t);
+    gl.uniform1f(gl.getUniformLocation(p, 'uAsp'), canvas.width / canvas.height);
+    gl.uniform2f(gl.getUniformLocation(p, 'uP'), x, y);
+    gl.uniform3f(gl.getUniformLocation(p, 'uV'), vx, vy, vz);
+    gl.uniform1f(gl.getUniformLocation(p, 'uR'), r);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    dst.swap();
+  }
+  function advect(dst, velocity, diss, dt) {
+    const p = P.adv; gl.useProgram(p);
+    target(dst.write, dst.write.w, dst.write.h);
+    bindTex(p, 'uV', 0, velocity.read.t);
+    bindTex(p, 'uS', 1, dst.read.t);
+    gl.uniform1f(gl.getUniformLocation(p, 'uDt'), dt);
+    gl.uniform1f(gl.getUniformLocation(p, 'uDis'), diss);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    dst.swap();
+  }
+
+  function stir(x, y, dx, dy) {
+    const c = PALS[pal][colorTick % 3]; colorTick++;
+    const force = 7.0;
+    splat(vel, x, y, dx * force, dy * force, 0, 0.0016);
+    splat(dye, x, y, c[0] * 0.6, c[1] * 0.6, c[2] * 0.6, 0.0028);
+  }
+  function demoBurst() {
+    for (let i = 0; i < 10; i++) {
+      const x = 0.2 + Math.random() * 0.6, y = 0.2 + Math.random() * 0.6;
+      const a = Math.random() * Math.PI * 2, m = 0.4 + Math.random() * 0.7;
+      stir(x, y, Math.cos(a) * m, Math.sin(a) * m);
+    }
+  }
+
+  let px = null, py = null;
+  function pos(e) {
+    const r = canvas.getBoundingClientRect();
+    return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+  }
+  canvas.addEventListener('pointerdown', (e) => {
+    const [x, y] = pos(e); px = x; py = y; lastPointer = performance.now();
+    stir(x, y, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4);
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (px === null) return;
+    const [x, y] = pos(e);
+    const dx = x - px, dy = y - py;
+    if (dx * dx + dy * dy > 0) {
+      const steps = 2;
+      for (let i = 1; i <= steps; i++) stir(px + dx * i / steps, py + dy * i / steps, dx / steps, dy / steps);
+      px = x; py = y; lastPointer = performance.now();
+    }
+  });
+  addEventListener('pointerup', () => { px = null; });
+
+  document.querySelectorAll('[data-pal]').forEach((b) => b.addEventListener('click', () => {
+    document.querySelectorAll('[data-pal]').forEach((o) => o.setAttribute('aria-pressed', 'false'));
+    b.setAttribute('aria-pressed', 'true');
+    pal = +b.dataset.pal;
+  }));
+  const pauseBtn = document.getElementById('pause');
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+  });
+  document.getElementById('reset').addEventListener('click', () => {
+    for (const d of [vel, dye, prs]) for (const s of [d.read, d.write]) {
+      target(s, s.w, s.h); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    demoBurst();
+  });
+
+  function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 1.5);
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+  }
+  addEventListener('resize', resize); resize();
+
+  const fpsEl = document.getElementById('fps');
+  let last = performance.now(), fpsA = 60, lastFps = 0, lastIdle = 0;
+  demoBurst();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    let dt = Math.min((now - last) / 1000, 1 / 30); last = now;
+    if (dt <= 0) return;
+    fpsA += ((1 / dt) - fpsA) * 0.05;
+    if (now - lastFps > 500) { fpsEl.textContent = Math.round(fpsA) + ' fps'; lastFps = now; }
+    if (paused) return;
+    if (now - lastPointer > 3500 && now - lastIdle > 900) {
+      lastIdle = now;
+      const x = 0.25 + Math.random() * 0.5, y = 0.25 + Math.random() * 0.5;
+      const a = Math.random() * Math.PI * 2;
+      stir(x, y, Math.cos(a) * 0.8, Math.sin(a) * 0.8);
+    }
+    const tx = 1 / SIM, ty = 1 / SIM;
+    advect(vel, vel, 0.15, dt);
+    let p = P.div; gl.useProgram(p);
+    target(div, SIM, SIM);
+    bindTex(p, 'uV', 0, vel.read.t);
+    gl.uniform2f(gl.getUniformLocation(p, 'uTx'), tx, ty);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    p = P.clr; gl.useProgram(p);
+    target(prs.write, SIM, SIM);
+    bindTex(p, 'uT', 0, prs.read.t);
+    gl.uniform1f(gl.getUniformLocation(p, 'uK'), 0.8);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    prs.swap();
+    p = P.prs; gl.useProgram(p);
+    for (let i = 0; i < JACOBI; i++) {
+      target(prs.write, SIM, SIM);
+      bindTex(p, 'uP', 0, prs.read.t);
+      bindTex(p, 'uD', 1, div.t);
+      gl.uniform2f(gl.getUniformLocation(p, 'uTx'), tx, ty);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      prs.swap();
+    }
+    p = P.grd; gl.useProgram(p);
+    target(vel.write, SIM, SIM);
+    bindTex(p, 'uV', 0, vel.read.t);
+    bindTex(p, 'uP', 1, prs.read.t);
+    gl.uniform2f(gl.getUniformLocation(p, 'uTx'), tx, ty);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    vel.swap();
+    advect(dye, vel, 0.22, dt);
+    p = P.show; gl.useProgram(p);
+    target(null, canvas.width, canvas.height);
+    bindTex(p, 'uD', 0, dye.read.t);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
