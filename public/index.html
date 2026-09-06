@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Undertow — stir the current</title>
 <meta name="description" content="A real-time GPU fluid simulation in your browser. Drag to stir dye into the current. WebGL2, no server, no dependencies.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -14,7 +14,7 @@
     --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:hidden;font-family:var(--sans)}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:hidden;font-family:var(--sans);-webkit-tap-highlight-color:transparent}
   #c{position:fixed;inset:0;width:100vw;height:100vh;display:block;touch-action:none;cursor:crosshair}
   .overlay{position:fixed;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;padding:clamp(16px,3.2vw,38px)}
   .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.26em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:9px}
@@ -22,7 +22,7 @@
   @keyframes p{0%,100%{opacity:.35}50%{opacity:1}}
   h1{font-size:clamp(38px,8.5vw,120px);font-weight:200;letter-spacing:.13em;margin:10px 0 0;line-height:.98;text-wrap:balance;text-shadow:0 0 40px rgba(94,234,212,.12)}
   .tag{margin:13px 0 0;color:var(--muted);font-size:clamp(13px,1.5vw,16px);max-width:38ch;line-height:1.5}
-  .bar{pointer-events:auto;display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--stroke);border-radius:14px;padding:8px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);width:fit-content;max-width:100%}
+  .bar{pointer-events:auto;display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--stroke);border-radius:14px;padding:8px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);width:fit-content;max-width:calc(100vw - 32px);overflow-x:auto}
   button{font:500 13px var(--sans);color:var(--text);background:rgba(255,255,255,.04);border:1px solid var(--stroke);border-radius:9px;padding:9px 13px;cursor:pointer;transition:background .18s,border-color .18s,transform .05s}
   button:hover{background:rgba(255,255,255,.09);border-color:rgba(140,180,220,.3)}
   button:active{transform:translateY(1px)}
@@ -71,17 +71,48 @@
  * splat pointer -> advect velocity -> divergence -> pressure Jacobi x20
  * -> subtract gradient -> advect dye -> display. No CPU in the loop. */
 const canvas = document.getElementById('c');
+const MOBILE = matchMedia('(pointer:coarse)').matches || Math.min(innerWidth, innerHeight) < 500 || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 const gl = canvas.getContext('webgl2', { antialias: false, depth: false, alpha: false });
-if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); document.getElementById('fallback').classList.add('on'); });
+// Phone GPUs often lack 32F render targets but do 16F (which is also
+// texture-filterable, unlike 32F). Probe a tiny FBO and use whichever
+// float format is actually renderable.
+let TEX_IFMT = 0;
+function floatOK() {
+  if (!gl) return false;
+  gl.getExtension('EXT_color_buffer_float');
+  gl.getExtension('EXT_color_buffer_half_float');
+  const probe = (ifmt) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, 4, 4, 0, gl.RGBA, gl.FLOAT, null);
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(f);
+    gl.deleteTexture(t);
+    return ok;
+  };
+  if (probe(gl.RGBA16F)) { TEX_IFMT = gl.RGBA16F; return true; }
+  if (probe(gl.RGBA32F)) { TEX_IFMT = gl.RGBA32F; return true; }
+  return false;
+}
+if (!floatOK()) {
   document.getElementById('fallback').classList.add('on');
 } else {
   main();
 }
 
 function main() {
-  const linear = !!gl.getExtension('OES_texture_float_linear');
+  const linear = TEX_IFMT === gl.RGBA16F || !!gl.getExtension('OES_texture_float_linear');
   const FILTER = linear ? gl.LINEAR : gl.NEAREST;
-  const SIM = 128, DYE = 512, JACOBI = 20;
+  const SIM = MOBILE ? 96 : 128, DYE = MOBILE ? 256 : 512, JACOBI = MOBILE ? 12 : 20;
   const PALS = [
     [[0.10, 0.85, 0.95], [0.35, 0.45, 1.00], [0.55, 1.00, 0.75]],
     [[1.00, 0.35, 0.15], [1.00, 0.70, 0.20], [0.85, 0.15, 0.45]],
@@ -175,7 +206,7 @@ function main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, FILTER);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, TEX_IFMT, w, h, 0, gl.RGBA, gl.FLOAT, null);
     const f = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, f);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
@@ -242,7 +273,7 @@ function main() {
   canvas.addEventListener('pointerdown', (e) => {
     const [x, y] = pos(e); px = x; py = y; lastPointer = performance.now();
     stir(x, y, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4);
-    canvas.setPointerCapture(e.pointerId);
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
   });
   canvas.addEventListener('pointermove', (e) => {
     if (px === null) return;
@@ -273,7 +304,7 @@ function main() {
   });
 
   function resize() {
-    const dpr = Math.min(devicePixelRatio || 1, 1.5);
+    const dpr = Math.min(devicePixelRatio || 1, MOBILE ? 1 : 1.5);
     canvas.width = Math.floor(innerWidth * dpr);
     canvas.height = Math.floor(innerHeight * dpr);
   }
